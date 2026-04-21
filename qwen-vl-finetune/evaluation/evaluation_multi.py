@@ -14,10 +14,10 @@ mp.set_start_method("spawn", force=True)
 WORKERS_PER_GPU = 1
 
 
-PROCESSOR_NAME = "./models/Qwen3-VL-4B-Instruct"
+PROCESSOR_NAME = "../models/Qwen3-VL-4B-Instruct"
 
-# MODEL_NAME = "./models/Qwen3-VL-4B-Instruct"
-MODEL_NAME = "./output_singleimages/checkpoint-1"
+MODEL_NAME = "../models/Qwen3-VL-4B-Instruct"
+# MODEL_NAME = "./output_singleimages/checkpoint-1"
 
 INPUT_JSON = "./demo/single_images_test.json"
 
