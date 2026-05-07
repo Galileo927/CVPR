@@ -19,13 +19,60 @@ PROCESSOR_NAME = "./models/Qwen3-VL-4B-Instruct"
 MODEL_NAME = "./models/Qwen3-VL-4B-Instruct"
 # MODEL_NAME = "./output_singleimages/checkpoint-1"
 
-INPUT_JSON = "./demo/single_images_test.json"
+DATASET_ROOT = "/root/autodl-tmp/PortraitCraft_dataset"
 
-OUTPUT_JSON = "./demo/single_images_test_res_sample.json"
+INPUT_JSON = os.path.join(DATASET_ROOT, "track_1_test.json")
 
-IMAGES_PATH = "./demo/images/"
+OUTPUT_JSON = "/root/autodl-tmp/CVPR/qwen-vl-finetune/track_1_test_res.json"
+
+IMAGES_PATH = DATASET_ROOT
 
 MAX_NEW_TOKENS = 512
+
+TRAIN_JSON = os.path.join(DATASET_ROOT, "track_1_train.json")
+
+IMAGE_SUBDIRS = [""] + [f"images_{i:02d}" for i in range(11)]
+
+CRITERIA_NAMES = [
+    "Color Harmony",
+    "Visual Style Consistency",
+    "Sharpness",
+    "Light and Shadow Modeling",
+    "Creativity and Originality",
+    "Exposure Control",
+    "Application of Classical Composition Principles",
+    "Depth of Field and Layering",
+    "Visual Center Stability",
+    "Visual Flow Guidance",
+    "Structural Support Stability",
+    "Appropriateness of Negative Space",
+    "Subject Integrity",
+]
+
+LEVEL_TO_SCORE = {
+    "Poor": 3.0,
+    "Medium": 6.0,
+    "Good": 8.5,
+    "A": 3.0,
+    "B": 6.0,
+    "C": 8.5,
+}
+
+CRITERION_WEIGHTS = {
+    "Color Harmony": 1.0,
+    "Visual Style Consistency": 1.0,
+    "Sharpness": 1.1,
+    "Light and Shadow Modeling": 1.0,
+    "Creativity and Originality": 0.9,
+    "Exposure Control": 1.0,
+    "Application of Classical Composition Principles": 1.15,
+    "Depth of Field and Layering": 1.05,
+    "Visual Center Stability": 1.2,
+    "Visual Flow Guidance": 1.15,
+    "Structural Support Stability": 1.05,
+    "Appropriateness of Negative Space": 1.1,
+    "Subject Integrity": 1.2,
+}
 
 
 
@@ -47,6 +94,18 @@ def resize_keep_aspect(image_path, max_size=2048):
     img = img.resize((new_w, new_h), Image.BILINEAR)
 
     return img
+
+
+def resolve_image_path(image_name):
+    if os.path.isabs(image_name) and os.path.exists(image_name):
+        return image_name
+
+    for subdir in IMAGE_SUBDIRS:
+        image_path = os.path.join(IMAGES_PATH, subdir, image_name)
+        if os.path.exists(image_path):
+            return image_path
+
+    return os.path.join(IMAGES_PATH, image_name)
 
 
 
@@ -108,14 +167,10 @@ class DemoServer:
 # ================== Prompt ==================
 def build_prompt(item):
 
-    criteria = item["criteria"]
     question = item["question"]
     options = item["options"]
 
-    criteria_text = "\n".join([
-        f"{k}: level={v['level']}"
-        for k, v in criteria.items()
-    ])
+    criteria_text = "\n".join([f"{i + 1}. {k}" for i, k in enumerate(CRITERIA_NAMES)])
 
     options_text = "\n".join([
         f"{k}. {v}"
@@ -136,7 +191,7 @@ TASKS:
 
 ---
 
-IMAGE CRITERIA:
+CRITERIA TO EVALUATE:
 {criteria_text}
 
 ---
@@ -205,6 +260,112 @@ def extract_json(text):
         return None
 
 
+def get_score_value(value):
+    if isinstance(value, dict):
+        if isinstance(value.get("score"), (int, float)):
+            return max(0.0, min(10.0, float(value["score"])))
+        value = value.get("level")
+
+    if isinstance(value, str):
+        value = value.strip()
+
+    return LEVEL_TO_SCORE.get(value)
+
+
+def compute_rank_proxy(item):
+    criteria = item.get("criteria")
+    if not isinstance(criteria, dict):
+        return None
+
+    weighted_sum = 0.0
+    weight_sum = 0.0
+
+    for name in CRITERIA_NAMES:
+        if name not in criteria:
+            continue
+
+        score = get_score_value(criteria[name])
+        if score is None:
+            continue
+
+        weight = CRITERION_WEIGHTS.get(name, 1.0)
+        weighted_sum += score * weight
+        weight_sum += weight
+
+    if weight_sum == 0:
+        return None
+
+    return weighted_sum / weight_sum
+
+
+def get_int_score(value):
+    try:
+        score = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+    return max(1, min(100, score))
+
+
+def load_train_score_distribution():
+    if not os.path.exists(TRAIN_JSON):
+        print(f"⚠️ train json not found, fallback to criteria proxy score: {TRAIN_JSON}")
+        return []
+
+    with open(TRAIN_JSON, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    scores = []
+    for item in data:
+        score = get_int_score(item.get("total_score"))
+        if score is not None:
+            scores.append(score)
+
+    scores.sort()
+    print(f"✅ loaded train score distribution: {len(scores)}")
+
+    return scores
+
+
+def apply_rankiqa_scores(records):
+    if not records:
+        return records
+
+    train_scores = load_train_score_distribution()
+    ranked = []
+
+    for idx, item in enumerate(records):
+        proxy = compute_rank_proxy(item)
+        raw_score = get_int_score(item.get("total_score"))
+
+        if proxy is None and raw_score is not None:
+            proxy = raw_score / 10.0
+
+        if proxy is None:
+            proxy = 6.0
+
+        ranked.append((proxy, raw_score or 0, item.get("image_path", ""), idx))
+
+    ranked.sort()
+
+    if train_scores:
+        max_train_idx = len(train_scores) - 1
+        max_rank_idx = max(1, len(ranked) - 1)
+
+        for rank, (_, _, _, idx) in enumerate(ranked):
+            train_idx = round(rank * max_train_idx / max_rank_idx)
+            records[idx]["total_score"] = train_scores[train_idx]
+    else:
+        for _, _, _, idx in ranked:
+            proxy = compute_rank_proxy(records[idx])
+            if proxy is not None:
+                records[idx]["total_score"] = max(1, min(100, int(round(proxy * 10))))
+
+    print(f"✅ applied RankIQA-style score calibration: {len(records)}")
+
+    return records
+
+
 # ================== NEW：读取历史结果 ==================
 def build_done_set_from_parts():
 
@@ -246,7 +407,7 @@ def worker_run(worker_id, gpu_id, data_chunk):
 
     for idx, item in enumerate(tqdm(data_chunk, desc=f"worker-{worker_id}")):
 
-        image_path = IMAGES_PATH + item["image_path"]
+        image_path = resolve_image_path(item["image_path"])
 
         if not os.path.exists(image_path):
             continue
@@ -297,7 +458,7 @@ def merge_results():
             for x in json.load(fp):
                 unique[x["image_path"]] = x
 
-    all_results = list(unique.values())
+    all_results = apply_rankiqa_scores(list(unique.values()))
 
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)
