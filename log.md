@@ -1,5 +1,7 @@
 # Track 1 Experiment Log
 
+Last updated: 2026-05-09
+
 Track: Portrait Composition Understanding  
 Dataset size: 2000 test images  
 Submission format: one JSON list with 2000 items
@@ -240,3 +242,63 @@ rm -f track_1_test_res.json track_1_test_res.json.part*.json
 CUDA_VISIBLE_DEVICES=0 python evaluation/evaluation_multi.py
 python convert_json_test.py --input track_1_test_res.json --output track_1_test_res_final.json
 ```
+
+## 2026-05-09
+
+### 修改内容
+
+本次只修改 `qwen-vl-finetune/evaluation/evaluation_multi.py` 的 prompt，不改模型权重、不改 answer 逻辑、不改 RankIQA-style 后处理。
+
+新增严格分类阈值：
+
+```text
+Poor: score < 5
+Medium: 5 <= score < 7
+Good: score >= 7
+```
+
+要求模型对每个 criterion 先估计隐藏的 0-10 分数，但不输出该分数，只输出 `Good / Medium / Poor`。
+
+同时明确：
+
+- `Good` 不等于“还可以”，必须有明确正向证据。
+- 普通、混合、有轻微缺陷的情况应判为 `Medium`。
+- 明显影响构图的问题应判为 `Poor`，即使图片整体观感还不错。
+- 不能因为整体印象好，就把大多数 criteria 都判成 `Good`。
+
+### 论文依据
+
+本次改动主要基于任务官方定义，而不是引入新的模型论文：
+
+- Track 1 明确给出 criteria 等级和分数区间：`A/Poor = [0,5)`, `B/Medium = [5,7)`, `C/Good = [7,10]`。
+- 之前 prompt 只写 `Good / Medium / Poor`，没有把这些硬阈值告诉模型，导致分类边界偏软。
+- RankIQA-style 后处理依赖 criteria 排序代理，因此 criteria 过度偏 `C` 会直接限制 SRCC 上限。
+
+### 理想效果
+
+1. 降低 `C` 的过度使用，尤其减少 `11C / 12C / 13C` 的高分段堆积。
+2. 增加 `B` 和合理的 `A`，让 criteria 分布更接近真实难度。
+3. 减少 total_score 排序代理中的并列和近似并列，提高 SRCC。
+4. 保持 Answer Acc 基本不变，因为 answer prompt 和输出逻辑没有改。
+5. 最终官方 JSON 格式不变。
+
+### 现实状态
+
+尚未重新全量推理和提交，因此没有新的线上指标。当前只能确认代码层面的 prompt 已改为硬阈值版本。
+
+### 风险与原因
+
+1. 该改动可能提升 criteria 严格性，但也可能让模型过度保守，导致 `Good` 变少过头。
+2. 如果真实测试集本身高质量图片较多，过度压低 `C` 可能损害 Criteria Acc。
+3. 由于仍然只输出三档 A/B/C，total_score 排序粒度仍然有限；该改动只能缓解高分段堆积，不能完全替代训练集拟合权重。
+
+### 下一步
+
+1. 全量跑完后先统计最终 JSON：
+   - `items == 2000`
+   - `NOT_RES == 0`
+   - `C` 占比是否明显低于之前的约 `77%`
+   - `11C / 12C / 13C` 是否明显减少
+   - `total_score` 是否仍有足够分布
+2. 如果 `C` 占比下降但 SRCC 没升，优先做训练集拟合 `LEVEL_TO_SCORE` 和 `CRITERION_WEIGHTS`。
+3. 如果 Criteria Acc 明显下降，回退到较软 prompt，只保留 `Good does not mean acceptable` 这一类轻约束。
