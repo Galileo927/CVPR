@@ -196,6 +196,22 @@ CRITERIA TO EVALUATE:
 
 ---
 
+STRICT LEVEL THRESHOLDS:
+For each criterion, first estimate a hidden numeric score from 0 to 10.
+Do NOT output these hidden scores.
+
+- Poor: score < 5. The flaw is obvious and materially harms portrait composition.
+- Medium: 5 <= score < 7. The criterion is acceptable or ordinary, but has visible limitations.
+- Good: score >= 7. The criterion is clearly above average with strong visual evidence.
+
+Good does NOT mean merely acceptable.
+Use Good only when the image provides clear positive evidence for that specific criterion.
+Use Medium for ordinary, mixed, or mildly flawed cases.
+Use Poor when the defect is visually clear, even if the overall image still looks good.
+Do not assign most criteria as Good based only on a positive overall impression.
+
+---
+
 QUESTION:
 {question}
 
@@ -237,7 +253,7 @@ IMPORTANT RULES:
 - Each criterion MUST be judged independently from image evidence.
 - total_score MUST NOT be a template value; it must reflect real visual quality.
 - answer MUST be grounded in visible evidence.
-- If unsure, choose Medium instead of guessing Good/Poor blindly.
+- If evidence for Good is not clear, do not choose Good.
 
 ---
 
