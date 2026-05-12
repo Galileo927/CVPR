@@ -35,3 +35,6 @@ env/
 .DS_Store
 .idea/
 .vscode/
+qwen-vl-finetune/checkpoint/
+qwen-vl-finetune/checkpoint/
+qwen-vl-finetune/checkpoint/
