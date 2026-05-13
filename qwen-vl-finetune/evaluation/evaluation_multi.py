@@ -47,6 +47,9 @@ CONSISTENCY_THRESHOLD = 30
 
 MAX_NEW_TOKENS = 768
 
+CONSENSUS_WEIGHT = 0.25
+CONSENSUS_SCORE_TOLERANCE = 6
+
 
 
 
@@ -203,12 +206,18 @@ class DemoServer:
             parsed_refined = extract_json_robust(raw_refined)
             if parsed_refined is not None:
                 refined_score, refined_detail = score_total_quality(parsed_refined)
+                peer_parsed_list = [x.get("parsed") for x in all_scored[1:] if x.get("parsed") is not None] + [parsed_refined]
+                refined_consensus, refined_consensus_detail = score_candidate_consensus(parsed_refined, peer_parsed_list)
+                refined_rank = refined_score * (1.0 - CONSENSUS_WEIGHT) + refined_consensus * CONSENSUS_WEIGHT
                 # 仅当修正后质量提升才替换
-                if refined_score > best["quality_score"]:
+                if refined_rank > best.get("rank_score", best["quality_score"]):
                     best["raw"] = raw_refined
                     best["parsed"] = parsed_refined
                     best["quality_score"] = refined_score
+                    best["consensus_score"] = refined_consensus
+                    best["rank_score"] = refined_rank
                     best["score_detail"] = refined_detail
+                    best["consensus_detail"] = refined_consensus_detail
                     best["refined"] = True
 
         return best, all_scored
@@ -631,6 +640,92 @@ def score_total_quality(parsed):
     return final, detail
 
 
+def score_candidate_consensus(parsed, peer_parsed_list):
+    """
+    计算单个候选在多候选集合中的共识分。
+
+    目标：
+    - criteria 维度上尽量贴近多数候选
+    - answer 尽量贴近多数候选
+    - total_score 不要偏离候选集中心太远
+    """
+    if not parsed or not isinstance(parsed, dict) or not peer_parsed_list:
+        return 0.0, {
+            "criteria_consensus": 0.0,
+            "answer_consensus": 0.0,
+            "score_consensus": 0.0,
+            "final": 0.0
+        }
+
+    criteria_votes = {dim: {} for dim in EXPECTED_DIMS}
+    answer_votes = {}
+    total_scores = []
+
+    for peer in peer_parsed_list:
+        if not peer or not isinstance(peer, dict):
+            continue
+
+        peer_criteria = peer.get("criteria", {})
+        if isinstance(peer_criteria, dict):
+            for dim in EXPECTED_DIMS:
+                val = str(peer_criteria.get(dim, "")).strip()
+                if val in VALID_LEVELS:
+                    criteria_votes[dim][val] = criteria_votes[dim].get(val, 0) + 1
+
+        ans = str(peer.get("answer", "")).strip().upper()
+        if ans in ("A", "B", "C", "D"):
+            answer_votes[ans] = answer_votes.get(ans, 0) + 1
+
+        try:
+            total_scores.append(int(float(peer.get("total_score"))))
+        except (TypeError, ValueError):
+            pass
+
+    criteria_match_score = 0.0
+    criteria_checked = 0
+    parsed_criteria = parsed.get("criteria", {})
+    if isinstance(parsed_criteria, dict):
+        for dim in EXPECTED_DIMS:
+            val = str(parsed_criteria.get(dim, "")).strip()
+            votes = criteria_votes.get(dim, {})
+            if not votes or val not in VALID_LEVELS:
+                continue
+            vote_total = sum(votes.values())
+            criteria_match_score += 100.0 * votes.get(val, 0) / vote_total
+            criteria_checked += 1
+
+    criteria_consensus = criteria_match_score / criteria_checked if criteria_checked else 0.0
+
+    ans = str(parsed.get("answer", "")).strip().upper()
+    if answer_votes and ans in answer_votes:
+        answer_consensus = 100.0 * answer_votes[ans] / sum(answer_votes.values())
+    else:
+        answer_consensus = 0.0
+
+    score_consensus = 0.0
+    if total_scores:
+        total_scores.sort()
+        mid = len(total_scores) // 2
+        median_score = total_scores[mid] if len(total_scores) % 2 == 1 else (total_scores[mid - 1] + total_scores[mid]) / 2.0
+        try:
+            current_score = int(float(parsed.get("total_score")))
+            deviation = abs(current_score - median_score)
+            score_consensus = max(0.0, 100.0 - deviation * CONSENSUS_SCORE_TOLERANCE)
+        except (TypeError, ValueError):
+            score_consensus = 0.0
+
+    final = criteria_consensus * 0.6 + answer_consensus * 0.15 + score_consensus * 0.25
+
+    detail = {
+        "criteria_consensus": criteria_consensus,
+        "answer_consensus": answer_consensus,
+        "score_consensus": score_consensus,
+        "final": final
+    }
+
+    return final, detail
+
+
 # ================== Phase 2: 多候选聚合 ==================
 def aggregate_candidates_gepa(candidates, consistency_threshold=None):
     if consistency_threshold is None:
@@ -649,33 +744,44 @@ def aggregate_candidates_gepa(candidates, consistency_threshold=None):
     if not candidates:
         return None, []
 
+    peer_parsed_list = [c.get("parsed") for c in candidates if c.get("parsed")]
+
     scored = []
     for c in candidates:
         parsed = c.get("parsed")
         if parsed:
-            score, detail = score_total_quality(parsed)
+            quality_score, detail = score_total_quality(parsed)
+            consensus_score, consensus_detail = score_candidate_consensus(parsed, peer_parsed_list)
+            rank_score = quality_score * (1.0 - CONSENSUS_WEIGHT) + consensus_score * CONSENSUS_WEIGHT
             scored.append({
                 "raw": c.get("raw", ""),
                 "parsed": parsed,
-                "quality_score": score,
-                "score_detail": detail
+                "quality_score": quality_score,
+                "consensus_score": consensus_score,
+                "rank_score": rank_score,
+                "score_detail": detail,
+                "consensus_detail": consensus_detail
             })
         else:
             scored.append({
                 "raw": c.get("raw", ""),
                 "parsed": None,
                 "quality_score": 0.0,
-                "score_detail": {"consistency": 0.0, "criteria_quality": 0.0, "answer_validity": 0.0, "final": 0.0}
+                "consensus_score": 0.0,
+                "rank_score": 0.0,
+                "score_detail": {"consistency": 0.0, "criteria_quality": 0.0, "answer_validity": 0.0, "final": 0.0},
+                "consensus_detail": {"criteria_consensus": 0.0, "answer_consensus": 0.0, "score_consensus": 0.0, "final": 0.0}
             })
 
-    # 按质量分降序
-    scored.sort(key=lambda x: x["quality_score"], reverse=True)
+    # 先看综合 rank_score，再看单候选质量分
+    scored.sort(key=lambda x: (x["rank_score"], x["quality_score"]), reverse=True)
 
     best = scored[0]
 
     # 低一致性 → Self-Refinement 候选标记
     if best["score_detail"]["consistency"] < consistency_threshold:
         best["needs_refine"] = True
+        best["refine_triggered"] = True
 
     return best, scored
 
@@ -822,6 +928,13 @@ def worker_run(worker_id, gpu_id, data_chunk, config):
     total_skipped_missing = 0
     total_skipped_parse = 0
     total_errors = 0
+    total_gepa_items = 0
+    total_valid_candidates = 0
+    total_refine_triggered = 0
+    total_refine_applied = 0
+    total_best_quality = 0.0
+    total_best_rank = 0.0
+    total_best_consensus = 0.0
 
     if os.path.exists(out_path):
         try:
@@ -852,6 +965,14 @@ def worker_run(worker_id, gpu_id, data_chunk, config):
                 )
                 raw = best["raw"]
                 parsed = best["parsed"]
+
+                total_gepa_items += 1
+                total_valid_candidates += sum(1 for c in all_scored if c.get("parsed") is not None)
+                total_refine_triggered += int(bool(best.get("refine_triggered", False)))
+                total_refine_applied += int(bool(best.get("refined", False)))
+                total_best_quality += float(best.get("quality_score", 0.0))
+                total_best_rank += float(best.get("rank_score", best.get("quality_score", 0.0)))
+                total_best_consensus += float(best.get("consensus_score", 0.0))
 
                 if parsed is None:
                     parsed = extract_json_robust(raw)
@@ -895,6 +1016,18 @@ def worker_run(worker_id, gpu_id, data_chunk, config):
           f"skipped_missing={total_skipped_missing} "
           f"skipped_parse={total_skipped_parse} "
           f"errors={total_errors}")
+    if total_gepa_items > 0:
+        avg_valid_candidates = total_valid_candidates / total_gepa_items
+        avg_best_quality = total_best_quality / total_gepa_items
+        avg_best_rank = total_best_rank / total_gepa_items
+        avg_best_consensus = total_best_consensus / total_gepa_items
+        print(f"[worker-{worker_id}] GEPA_STATS: items={total_gepa_items} "
+              f"avg_valid_candidates={avg_valid_candidates:.2f} "
+              f"refine_triggered={total_refine_triggered} "
+              f"refine_applied={total_refine_applied} "
+              f"avg_best_quality={avg_best_quality:.2f} "
+              f"avg_best_consensus={avg_best_consensus:.2f} "
+              f"avg_best_rank={avg_best_rank:.2f}")
 
 
 # ================== Merge ==================
