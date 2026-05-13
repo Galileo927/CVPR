@@ -1,6 +1,6 @@
 # Track 1 Experiment Log
 
-Last updated: 2026-05-09
+Last updated: 2026-05-13
 
 Track: Portrait Composition Understanding  
 Dataset size: 2000 test images  
@@ -542,3 +542,122 @@ python convert_json_test.py --input track_1_test_res.json --output track_1_test_
 - `NOT_RES == 0`（应天然为 0）
 - A/B/C 分布、`total_score` 直方图、unique 数与上次对比
 - worker 日志：`skipped_parse / errors` 应远低于上次（robust parser + validate 兜底）
+
+## 2026-05-13
+
+### 实际提交结果
+
+```text
+Participant: borui_yao
+ID: 726880
+SRCC: 0.83
+PLCC: 0.83
+Criteria Acc: 0.51
+Answer Acc: 0.89
+```
+
+对比：
+
+```text
+2026-05-07: 0.65 / 0.65 / 0.40 / 0.79
+2026-05-12: 0.65 / 0.66 / 0.39 / 0.78
+2026-05-13: 0.83 / 0.83 / 0.51 / 0.89
+```
+
+### 当前判断
+
+1. 这次提升不是单一 prompt tweak，主要是多因素叠加：
+   - `./models/checkpoint` 已确认是 LoRA adapter，不是完整模型目录。
+   - 当前推理链路采用 `GEPA + CoT + Self-Refinement + robust parser`。
+   - `total_score` 不再依赖 RankIQA-style 后处理，而是依赖多候选筛选后的模型直接输出。
+2. LoRA checkpoint 很可能是本次大幅提分的最大变量。
+3. 推理侧增强也明显有效，否则四项指标不会同时上涨。
+
+### 本地结果分布
+
+当前 `track_1_test_res.json` 统计：
+
+```text
+items: 2000
+score_unique: 19
+score_range: 32-82
+score_mean: 59.956
+criteria: Good=17841, Medium=4549, Poor=3610
+answers: B=526, A=506, C=491, D=477
+13 Good: 395
+12 Good: 348
+11 Good: 234
+```
+
+结论：
+
+1. 输出格式已经稳定，非法 answer / 缺失 criteria 基本被清除。
+2. `Poor` 已经明显回来了，criteria 不再像早期版本那样一边倒偏 `Good`。
+3. 高分段仍然偏拥挤，`11/12/13 Good` 合计仍然较高，后续还可以继续优化总分区分度。
+
+### 为什么会提分
+
+1. **LoRA adapter**
+   - `adapter_config.json` 已确认存在，说明当前跑的是 base model + LoRA merge。
+   - 这通常直接提升 criteria 理解和 answer 选择能力。
+
+2. **GEPA 多候选推理**
+   - 每张图生成 5 个候选，温度递增覆盖。
+   - 候选中更差的输出会被后续质量评分淘汰。
+
+3. **CoT prompt**
+   - 先逐维分析 13 个 criteria，再输出 JSON。
+   - 对 `Criteria Acc` 和 `Answer Acc` 的帮助最直接。
+
+4. **一致性筛选**
+   - `score_internal_consistency` 会检查 `criteria` 分布和 `total_score` 是否匹配。
+   - 这一步对 `SRCC/PLCC` 提升贡献很大。
+
+5. **Self-Refinement + robust parser**
+   - 低一致性候选会二次修正。
+   - 坏 JSON、缺字段、非法值会被兜底修复。
+
+### 今日脚本升级
+
+本次在 `evaluation_multi.py` 上新增两个推理增强点：
+
+1. **多候选共识分**
+   - 新增 `score_candidate_consensus()`。
+   - 对每个候选计算：
+     - criteria 是否与其他候选多数一致
+     - answer 是否与其他候选多数一致
+     - total_score 是否接近候选集中心
+   - `aggregate_candidates_gepa()` 不再只按 `quality_score` 选优，而是按：
+
+```text
+rank_score = quality_score * 0.75 + consensus_score * 0.25
+```
+
+2. **GEPA 运行统计**
+   - 在 `worker_run()` 中新增：
+     - `avg_valid_candidates`
+     - `refine_triggered`
+     - `refine_applied`
+     - `avg_best_quality`
+     - `avg_best_consensus`
+     - `avg_best_rank`
+   - 用于判断当前 0.83 的来源究竟更偏向模型本身，还是多候选筛选/修正机制。
+
+3. **Self-Refine 替换条件修正**
+   - 旧逻辑只按 `quality_score` 判断修正后是否替换。
+   - 现逻辑改成按 `rank_score` 判断，和主聚合逻辑保持一致，避免修正后自洽但与候选共识更差的结果被错误替换。
+
+### 这次升级的理想效果
+
+1. 在不改模型权重的前提下，让 GEPA 真正利用“跨候选共识”，而不是只看单候选自评。
+2. 进一步降低偶然高分、但和其余候选明显冲突的 bad candidate 被选中的概率。
+3. 为下一步优化提供可观测统计，而不是继续盲调 prompt。
+
+### 下一步
+
+1. 先用升级后的脚本再跑一轮，对比：
+   - `SRCC/PLCC` 是否继续涨
+   - `refine_triggered / refine_applied` 是否足够高
+   - `avg_best_consensus` 是否和高分提交正相关
+2. 如果分数继续涨，说明“共识分”是有效方向。
+3. 如果分数不涨但统计显示候选有效率已经很高，下一步优先优化高分段拥挤问题，而不是继续加候选数。
