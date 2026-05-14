@@ -47,9 +47,6 @@ CONSISTENCY_THRESHOLD = 30
 
 MAX_NEW_TOKENS = 768
 
-CONSENSUS_WEIGHT = 0.25
-CONSENSUS_SCORE_TOLERANCE = 6
-
 
 
 
@@ -206,18 +203,12 @@ class DemoServer:
             parsed_refined = extract_json_robust(raw_refined)
             if parsed_refined is not None:
                 refined_score, refined_detail = score_total_quality(parsed_refined)
-                peer_parsed_list = [x.get("parsed") for x in all_scored[1:] if x.get("parsed") is not None] + [parsed_refined]
-                refined_consensus, refined_consensus_detail = score_candidate_consensus(parsed_refined, peer_parsed_list)
-                refined_rank = refined_score * (1.0 - CONSENSUS_WEIGHT) + refined_consensus * CONSENSUS_WEIGHT
                 # 仅当修正后质量提升才替换
-                if refined_rank > best.get("rank_score", best["quality_score"]):
+                if refined_score > best["quality_score"]:
                     best["raw"] = raw_refined
                     best["parsed"] = parsed_refined
                     best["quality_score"] = refined_score
-                    best["consensus_score"] = refined_consensus
-                    best["rank_score"] = refined_rank
                     best["score_detail"] = refined_detail
-                    best["consensus_detail"] = refined_consensus_detail
                     best["refined"] = True
 
         return best, all_scored
@@ -273,14 +264,8 @@ def build_prompt(item, use_cot=False):
     - 再输出 FINAL OUTPUT JSON
     - 强制模型"先思考再下结论"，减少直觉性瞎猜
     """
-    criteria = item["criteria"]
     question = item["question"]
     options = item["options"]
-
-    criteria_text = "\n".join([
-        f"{k}: level={v['level']}"
-        for k, v in criteria.items()
-    ])
 
     options_text = "\n".join([
         f"{k}. {v}"
@@ -640,90 +625,122 @@ def score_total_quality(parsed):
     return final, detail
 
 
-def score_candidate_consensus(parsed, peer_parsed_list):
+# ================== P0: 温度稳定性评分 ==================
+def score_temperature_stability(all_scored):
     """
-    计算单个候选在多候选集合中的共识分。
-
-    目标：
-    - criteria 维度上尽量贴近多数候选
-    - answer 尽量贴近多数候选
-    - total_score 不要偏离候选集中心太远
+    P0: 温度稳定性评分。
+    原理：同一张图、不同温度采样下，模型判断越一致 → 越可信。
+    
+    返回 0~100。
+    - ≥70: 高度稳定（模型很确定自己的判断）
+    - 45~70: 中等波动（模型略有摇摆）
+    - <45: 剧烈波动（模型自己也不确定）
     """
-    if not parsed or not isinstance(parsed, dict) or not peer_parsed_list:
-        return 0.0, {
-            "criteria_consensus": 0.0,
-            "answer_consensus": 0.0,
-            "score_consensus": 0.0,
-            "final": 0.0
-        }
+    valid = [c for c in all_scored if c.get("parsed") is not None]
+    if len(valid) < 2:
+        return 50.0
 
-    criteria_votes = {dim: {} for dim in EXPECTED_DIMS}
-    answer_votes = {}
-    total_scores = []
-
-    for peer in peer_parsed_list:
-        if not peer or not isinstance(peer, dict):
-            continue
-
-        peer_criteria = peer.get("criteria", {})
-        if isinstance(peer_criteria, dict):
-            for dim in EXPECTED_DIMS:
-                val = str(peer_criteria.get(dim, "")).strip()
-                if val in VALID_LEVELS:
-                    criteria_votes[dim][val] = criteria_votes[dim].get(val, 0) + 1
-
-        ans = str(peer.get("answer", "")).strip().upper()
-        if ans in ("A", "B", "C", "D"):
-            answer_votes[ans] = answer_votes.get(ans, 0) + 1
-
+    # 1) total_score 稳定性：各候选总分标准差映射
+    scores = []
+    for c in valid:
         try:
-            total_scores.append(int(float(peer.get("total_score"))))
-        except (TypeError, ValueError):
-            pass
-
-    criteria_match_score = 0.0
-    criteria_checked = 0
-    parsed_criteria = parsed.get("criteria", {})
-    if isinstance(parsed_criteria, dict):
-        for dim in EXPECTED_DIMS:
-            val = str(parsed_criteria.get(dim, "")).strip()
-            votes = criteria_votes.get(dim, {})
-            if not votes or val not in VALID_LEVELS:
-                continue
-            vote_total = sum(votes.values())
-            criteria_match_score += 100.0 * votes.get(val, 0) / vote_total
-            criteria_checked += 1
-
-    criteria_consensus = criteria_match_score / criteria_checked if criteria_checked else 0.0
-
-    ans = str(parsed.get("answer", "")).strip().upper()
-    if answer_votes and ans in answer_votes:
-        answer_consensus = 100.0 * answer_votes[ans] / sum(answer_votes.values())
+            scores.append(int(float(c["parsed"].get("total_score", 0))))
+        except:
+            scores.append(50)
+    if len(scores) >= 2:
+        mean_s = sum(scores) / len(scores)
+        score_std = (sum((s - mean_s) ** 2 for s in scores) / len(scores)) ** 0.5
+        # std≤5→100, std≈25→50, std≥50→0
+        score_stability = max(0, min(100, 100 - score_std * 2))
     else:
-        answer_consensus = 0.0
+        score_stability = 50.0
 
-    score_consensus = 0.0
-    if total_scores:
-        total_scores.sort()
-        mid = len(total_scores) // 2
-        median_score = total_scores[mid] if len(total_scores) % 2 == 1 else (total_scores[mid - 1] + total_scores[mid]) / 2.0
-        try:
-            current_score = int(float(parsed.get("total_score")))
-            deviation = abs(current_score - median_score)
-            score_consensus = max(0.0, 100.0 - deviation * CONSENSUS_SCORE_TOLERANCE)
-        except (TypeError, ValueError):
-            score_consensus = 0.0
+    # 2) criteria 分布稳定性：13 维中与多数判断偏离的比例
+    level_map = {"Good": 2, "Medium": 1, "Poor": 0}
+    dim_conflict_count = 0
+    total_dims = 0
+    for dim in EXPECTED_DIMS:
+        dim_levels = []
+        for c in valid:
+            val = str(c["parsed"].get("criteria", {}).get(dim, "")).strip()
+            if val in level_map:
+                dim_levels.append(level_map[val])
+        if len(dim_levels) >= 4:  # 至少4个候选有值才评估
+            total_dims += 1
+            # 计算多数派占比：最高的 level 值出现次数
+            max_count = max(dim_levels.count(l) for l in set(dim_levels))
+            ratio = max_count / len(dim_levels)
+            if ratio < 0.5:  # 多数派不到一半 → 严重分歧
+                dim_conflict_count += 1
+            elif ratio < 0.7:  # 70~100% 一致 → 轻微分歧
+                dim_conflict_count += 0.3
 
-    final = criteria_consensus * 0.6 + answer_consensus * 0.15 + score_consensus * 0.25
+    if total_dims > 0:
+        criteria_stability = max(0, 100 - (dim_conflict_count / total_dims) * 100)
+    else:
+        criteria_stability = 50.0
 
-    detail = {
-        "criteria_consensus": criteria_consensus,
-        "answer_consensus": answer_consensus,
-        "score_consensus": score_consensus,
-        "final": final
-    }
+    # 3) answer 稳定性：多数选项占比
+    answers = []
+    for c in valid:
+        ans = str(c["parsed"].get("answer", "")).strip().upper()
+        if ans in "ABCD":
+            answers.append(ans)
+    if answers:
+        from collections import Counter
+        top_count = Counter(answers).most_common(1)[0][1]
+        answer_stability = (top_count / len(answers)) * 100
+    else:
+        answer_stability = 50.0
 
-    return final, detail
+    return min(100, max(0,
+        score_stability * 0.4 + criteria_stability * 0.4 + answer_stability * 0.2
+    ))
+
+
+# ================== P1: 跨维度相关性评分 ==================
+AESTHETIC_CORRELATION_RULES = [
+    # (维度A, 维度B, 矛盾惩罚值)
+    # 这些维度在人像美学评估中存在自然正相关
+    ("Sharpness", "Depth of Field and Layering", 8),
+    ("Exposure Control", "Light and Shadow Modeling", 6),
+    ("Visual Center Stability", "Visual Flow Guidance", 7),
+    ("Structural Support Stability", "Application of Classical Composition Principles", 5),
+    ("Appropriateness of Negative Space", "Visual Flow Guidance", 4),
+]
+
+
+def score_cross_dimension_consistency(parsed):
+    """
+    P1: 跨维度相关性评分。
+    原理：某些美学维度存在自然正相关。
+    模型给出反常的 Good↔Poor 对立 → 扣分。
+    
+    返回 0~100。
+    满分 = 无矛盾。只在模型自身判断彼此矛盾时扣分，
+    图片本身质量好坏不影响此分。
+    """
+    if not parsed or not isinstance(parsed, dict):
+        return 100.0
+    criteria = parsed.get("criteria", {})
+    if not isinstance(criteria, dict):
+        return 100.0
+
+    level_order = {"Good": 2, "Medium": 1, "Poor": 0}
+    penalty = 0.0
+
+    for dim_a, dim_b, max_p in AESTHETIC_CORRELATION_RULES:
+        va = str(criteria.get(dim_a, "")).strip()
+        vb = str(criteria.get(dim_b, "")).strip()
+        if va not in level_order or vb not in level_order:
+            continue
+        diff = abs(level_order[va] - level_order[vb])
+        if diff == 2:      # Good vs Poor → 严重反常
+            penalty += max_p
+        elif diff == 1:    # Good vs Medium 或 Medium vs Poor → 轻微警告
+            penalty += max_p * 0.3
+
+    return max(0, min(100, 100 - penalty))
 
 
 # ================== Phase 2: 多候选聚合 ==================
@@ -744,46 +761,93 @@ def aggregate_candidates_gepa(candidates, consistency_threshold=None):
     if not candidates:
         return None, []
 
-    peer_parsed_list = [c.get("parsed") for c in candidates if c.get("parsed")]
-
     scored = []
     for c in candidates:
         parsed = c.get("parsed")
         if parsed:
-            quality_score, detail = score_total_quality(parsed)
-            consensus_score, consensus_detail = score_candidate_consensus(parsed, peer_parsed_list)
-            rank_score = quality_score * (1.0 - CONSENSUS_WEIGHT) + consensus_score * CONSENSUS_WEIGHT
+            score, detail = score_total_quality(parsed)
             scored.append({
                 "raw": c.get("raw", ""),
                 "parsed": parsed,
-                "quality_score": quality_score,
-                "consensus_score": consensus_score,
-                "rank_score": rank_score,
+                "quality_score": score,
                 "score_detail": detail,
-                "consensus_detail": consensus_detail
+                "temperature": c.get("temperature")
             })
         else:
             scored.append({
                 "raw": c.get("raw", ""),
                 "parsed": None,
                 "quality_score": 0.0,
-                "consensus_score": 0.0,
-                "rank_score": 0.0,
                 "score_detail": {"consistency": 0.0, "criteria_quality": 0.0, "answer_validity": 0.0, "final": 0.0},
-                "consensus_detail": {"criteria_consensus": 0.0, "answer_consensus": 0.0, "score_consensus": 0.0, "final": 0.0}
+                "temperature": c.get("temperature")
             })
 
-    # 先看综合 rank_score，再看单候选质量分
-    scored.sort(key=lambda x: (x["rank_score"], x["quality_score"]), reverse=True)
+    # 按质量分降序
+    scored.sort(key=lambda x: x["quality_score"], reverse=True)
 
     best = scored[0]
 
     # 低一致性 → Self-Refinement 候选标记
     if best["score_detail"]["consistency"] < consistency_threshold:
         best["needs_refine"] = True
-        best["refine_triggered"] = True
 
     return best, scored
+
+
+def fuse_candidates(all_scored):
+    """
+    P0+P1 融合输出：
+    - answer: 所有候选 quality_score 加权投票
+    - criteria: Top-3 quality_score 加权 per-dimension 投票
+    - total_score: Top-3 quality_score 加权平均后四舍五入
+
+    all_scored: [{"parsed": {...}, "quality_score": 91.0}, ...]
+    Returns: {"total_score": 72, "criteria": {...}, "answer": "B"}
+    """
+    valid = [c for c in all_scored if c.get("parsed") is not None]
+    if not valid:
+        return None
+
+    valid.sort(key=lambda x: x["quality_score"], reverse=True)
+    top3 = valid[:3]
+    weights = [c["quality_score"] for c in top3]
+    total_weight = sum(weights)
+    if total_weight == 0:
+        return None
+
+    # ── total_score: Top-3 加权平均 ──
+    weighted_sum = 0.0
+    for c, w in zip(top3, weights):
+        try:
+            weighted_sum += int(float(c["parsed"].get("total_score", 0))) * w
+        except:
+            weighted_sum += 50 * w
+    fused_score = round(weighted_sum / total_weight)
+    fused_score = max(1, min(100, fused_score))
+
+    # ── criteria: Top-3 每维独立加权投票 ──
+    fused_criteria = {}
+    for dim in EXPECTED_DIMS:
+        vote = {"Good": 0.0, "Medium": 0.0, "Poor": 0.0}
+        for c, w in zip(top3, weights):
+            val = str(c["parsed"].get("criteria", {}).get(dim, "")).strip()
+            if val in VALID_LEVELS:
+                vote[val] += w
+        fused_criteria[dim] = max(vote, key=vote.get)
+
+    # ── answer: 全部候选加权投票 ──
+    answer_vote = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+    for c in valid:
+        ans = str(c["parsed"].get("answer", "")).strip().upper()
+        if ans in answer_vote:
+            answer_vote[ans] += c["quality_score"]
+    fused_answer = max(answer_vote, key=answer_vote.get)
+
+    return {
+        "total_score": fused_score,
+        "criteria": fused_criteria,
+        "answer": fused_answer
+    }
 
 
 # ================== Phase 2+3: 鲁棒 JSON 解析 ==================
@@ -930,11 +994,13 @@ def worker_run(worker_id, gpu_id, data_chunk, config):
     total_errors = 0
     total_gepa_items = 0
     total_valid_candidates = 0
+    total_fallback_t02 = 0
+    total_best_only = 0
+    total_fusion = 0
     total_refine_triggered = 0
     total_refine_applied = 0
-    total_best_quality = 0.0
-    total_best_rank = 0.0
-    total_best_consensus = 0.0
+    total_stability = 0.0
+    total_consistency = 0.0
 
     if os.path.exists(out_path):
         try:
@@ -964,18 +1030,55 @@ def worker_run(worker_id, gpu_id, data_chunk, config):
                     use_cot=enable_cot
                 )
                 raw = best["raw"]
-                parsed = best["parsed"]
+
+                # P0: 温度稳定性
+                stability = score_temperature_stability(all_scored)
+                # 现有自洽性（best 候选的 consistency，由 aggregate_candidates_gepa 计算）
+                consistency = best.get("score_detail", {}).get("consistency", 0)
 
                 total_gepa_items += 1
                 total_valid_candidates += sum(1 for c in all_scored if c.get("parsed") is not None)
-                total_refine_triggered += int(bool(best.get("refine_triggered", False)))
+                total_refine_triggered += int(bool(best.get("needs_refine", False)))
                 total_refine_applied += int(bool(best.get("refined", False)))
-                total_best_quality += float(best.get("quality_score", 0.0))
-                total_best_rank += float(best.get("rank_score", best.get("quality_score", 0.0)))
-                total_best_consensus += float(best.get("consensus_score", 0.0))
+                total_stability += float(stability)
+                total_consistency += float(consistency)
 
-                if parsed is None:
-                    parsed = extract_json_robust(raw)
+                # ── 2×2 决策矩阵 ──
+                parsed = None
+                if stability < 45 and consistency < 30:
+                    # ❌ 低稳 + 低洽 → 所有候选不可靠 → 降级取 temp=0.2 候选（最保守）
+                    total_fallback_t02 += 1
+                    for c in all_scored:
+                        if c.get("temperature") == 0.2:
+                            parsed = c.get("parsed")
+                            if parsed is None:
+                                parsed = extract_json_robust(c.get("raw", ""))
+                            break
+                    if parsed is None:
+                        parsed = best["parsed"]  # 兜底
+                    if idx < 3:
+                        print(f"[worker-{worker_id}] FALLBACK t=0.2: stability={stability:.0f} consistency={consistency:.0f}")
+
+                elif stability < 45 and consistency >= 30:
+                    # ⚠️ 低稳 + 高洽 → 候选模板化嫌疑 → 弃用融合，单取最优候选
+                    total_best_only += 1
+                    if idx < 3:
+                        print(f"[worker-{worker_id}] FALLBACK best-only: stability={stability:.0f} consistency={consistency:.0f}")
+                    parsed = best["parsed"]
+                    if parsed is None:
+                        parsed = extract_json_robust(raw)
+
+                else:
+                    # ✅ 高稳高洽 或 高稳低洽 → 正常 Top-3 融合
+                    #    （高稳低洽的 Self-Refine 已在 infer_one_gepa 内触发）
+                    total_fusion += 1
+                    fused = fuse_candidates(all_scored)
+                    if fused is not None:
+                        parsed = fused
+                    else:
+                        parsed = best["parsed"]
+                        if parsed is None:
+                            parsed = extract_json_robust(raw)
             else:
                 raw = server.infer_one(image_path, prompt)
                 parsed = extract_json(raw)
@@ -1018,16 +1121,17 @@ def worker_run(worker_id, gpu_id, data_chunk, config):
           f"errors={total_errors}")
     if total_gepa_items > 0:
         avg_valid_candidates = total_valid_candidates / total_gepa_items
-        avg_best_quality = total_best_quality / total_gepa_items
-        avg_best_rank = total_best_rank / total_gepa_items
-        avg_best_consensus = total_best_consensus / total_gepa_items
-        print(f"[worker-{worker_id}] GEPA_STATS: items={total_gepa_items} "
+        avg_stability = total_stability / total_gepa_items
+        avg_consistency = total_consistency / total_gepa_items
+        print(f"[worker-{worker_id}] GEPA_BRANCH_STATS: items={total_gepa_items} "
               f"avg_valid_candidates={avg_valid_candidates:.2f} "
+              f"fusion={total_fusion} "
+              f"fallback_t02={total_fallback_t02} "
+              f"best_only={total_best_only} "
               f"refine_triggered={total_refine_triggered} "
               f"refine_applied={total_refine_applied} "
-              f"avg_best_quality={avg_best_quality:.2f} "
-              f"avg_best_consensus={avg_best_consensus:.2f} "
-              f"avg_best_rank={avg_best_rank:.2f}")
+              f"avg_stability={avg_stability:.2f} "
+              f"avg_consistency={avg_consistency:.2f}")
 
 
 # ================== Merge ==================

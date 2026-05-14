@@ -1,6 +1,6 @@
 # Track 1 Experiment Log
 
-Last updated: 2026-05-13
+Last updated: 2026-05-14
 
 Track: Portrait Composition Understanding  
 Dataset size: 2000 test images  
@@ -661,3 +661,95 @@ rank_score = quality_score * 0.75 + consensus_score * 0.25
    - `avg_best_consensus` 是否和高分提交正相关
 2. 如果分数继续涨，说明“共识分”是有效方向。
 3. 如果分数不涨但统计显示候选有效率已经很高，下一步优先优化高分段拥挤问题，而不是继续加候选数。
+
+## 2026-05-14
+
+### 当前推理修改状态
+
+今天的 `evaluation_multi.py` 仍处在待全量重跑阶段，`res/v3` 只是 2026-05-13 的旧结果，不用于评估今天的新推理。
+
+当前新推理主线：
+
+```text
+GEPA 多温度候选 -> quality_score 排序 -> 温度稳定性判断 -> Top-3 融合 / fallback
+```
+
+具体逻辑：
+
+1. 每张图仍生成 5 个候选，温度为 `[0.2, 0.3, 0.4, 0.5, 0.7]`。
+2. `score_temperature_stability()` 评估同一张图在不同温度下的输出稳定性：
+   - `total_score` 方差
+   - 13 个 criteria 的多数派一致性
+   - answer 多数派一致性
+3. `worker_run()` 根据 `stability` 和 `consistency` 走 2x2 决策：
+   - `stability < 45` 且 `consistency < 30`：回退到 `temperature=0.2` 的保守候选。
+   - `stability < 45` 且 `consistency >= 30`：只使用 best candidate，不做融合。
+   - 其他情况：使用 `fuse_candidates()` 做 Top-3 加权融合。
+4. `fuse_candidates()` 的输出方式：
+   - `total_score`：Top-3 按 `quality_score` 加权平均。
+   - criteria：Top-3 按维度加权投票。
+   - answer：所有有效候选按 `quality_score` 加权投票。
+
+### 本次新增补丁：GEPA_BRANCH_STATS
+
+本次只新增运行统计，不改变最终提交 JSON 的字段格式，也不改变候选融合决策。
+
+新增统计项：
+
+```text
+GEPA_BRANCH_STATS:
+items
+avg_valid_candidates
+fusion
+fallback_t02
+best_only
+refine_triggered
+refine_applied
+avg_stability
+avg_consistency
+```
+
+### 为什么加这个补丁
+
+当前新推理的关键不只是模型输出，而是 2x2 决策矩阵实际如何分流。没有统计时，全量跑完只能看到榜单结果，无法判断涨分或掉分来自哪里。
+
+这些统计用于判断：
+
+1. `fusion` 占比高且榜单提升：说明 Top-3 融合路线有效。
+2. `fallback_t02` 占比高且榜单下降：说明稳定性阈值可能过严，或多温度候选波动过大。
+3. `best_only` 占比高：说明融合被频繁禁用，当前策略偏保守。
+4. `avg_stability` 低：说明温度序列过散，候选间分歧过大。
+5. `avg_consistency` 低：说明 `total_score` 和 criteria 分布仍不够自洽。
+6. `refine_triggered / refine_applied` 可判断 Self-Refinement 是否真正参与修正。
+
+### 理想效果
+
+这次补丁本身不应直接提高 `SRCC/PLCC/Criteria Acc/Answer Acc`，因为它只增加日志观测。
+
+理想效果是：
+
+1. 全量跑完后能解释新推理的行为分布。
+2. 为下一步调参提供依据：
+   - 是否调整 `stability < 45` 阈值。
+   - 是否保留 Top-3 fusion。
+   - 是否恢复跨候选共识分。
+   - 是否把 P1 跨维度相关性评分接入 `quality_score`。
+
+### 当前风险
+
+1. `score_cross_dimension_consistency()` 已定义但尚未接入候选打分，因此 P1 当前不影响结果。
+2. 2026-05-13 版本里的 `score_candidate_consensus()` / `rank_score` 已被当前新推理替换。如果新推理掉分，需要优先比较“共识选优”与“Top-3 融合”两条路线。
+3. `res/v3` 是旧结果，不能用于证明 2026-05-14 新推理有效。
+
+### 下一步
+
+全量重跑后先记录每个 worker 的 `GEPA_BRANCH_STATS`，再对比榜单四项指标：
+
+```text
+SRCC
+PLCC
+Criteria Acc
+Answer Acc
+```
+
+如果 `fusion` 占多数且分数提升，继续优化融合权重；如果 `fallback_t02` 或 `best_only` 占比异常高，先调稳定性阈值和温度序列，不急着改 prompt。
