@@ -709,6 +709,9 @@ AESTHETIC_CORRELATION_RULES = [
     ("Appropriateness of Negative Space", "Visual Flow Guidance", 4),
 ]
 
+CRITERIA_CONFIDENCE_MARGIN = 0.20
+ANSWER_CONFIDENCE_MARGIN = 0.15
+
 
 def score_cross_dimension_consistency(parsed):
     """
@@ -741,6 +744,195 @@ def score_cross_dimension_consistency(parsed):
             penalty += max_p * 0.3
 
     return max(0, min(100, 100 - penalty))
+
+
+def get_candidate_level(candidate, dim):
+    if not candidate or not candidate.get("parsed"):
+        return None
+    val = str(candidate["parsed"].get("criteria", {}).get(dim, "")).strip()
+    return val if val in VALID_LEVELS else None
+
+
+def get_weighted_level_votes(candidates, dim):
+    vote = {"Good": 0.0, "Medium": 0.0, "Poor": 0.0}
+    for c in candidates:
+        val = get_candidate_level(c, dim)
+        if val in vote:
+            vote[val] += max(0.0, float(c.get("quality_score", 0.0)))
+    return vote
+
+
+def fuse_criteria_by_confidence(valid_candidates):
+    """
+    Criteria-specific fusion.
+
+    高置信维度使用 Top-3 候选的 quality_score 加权投票；
+    低置信维度回退到 best candidate，降低多候选投票误伤。
+    """
+    if not valid_candidates:
+        return {dim: "Medium" for dim in EXPECTED_DIMS}
+
+    valid = sorted(valid_candidates, key=lambda x: x["quality_score"], reverse=True)
+    best = valid[0]
+    top_candidates = valid[:3]
+    fused = {}
+
+    for dim in EXPECTED_DIMS:
+        vote = get_weighted_level_votes(top_candidates, dim)
+        total = sum(vote.values())
+        if total <= 0:
+            best_val = get_candidate_level(best, dim)
+            fused[dim] = best_val or "Medium"
+            continue
+
+        ranked = sorted(vote.items(), key=lambda x: x[1], reverse=True)
+        top_label, top_weight = ranked[0]
+        second_weight = ranked[1][1]
+        margin = (top_weight - second_weight) / total
+
+        if margin >= CRITERIA_CONFIDENCE_MARGIN:
+            fused[dim] = top_label
+        else:
+            best_label = get_candidate_level(best, dim)
+            fused[dim] = best_label or top_label
+
+    return fused
+
+
+def get_candidate_answer(candidate):
+    if not candidate or not candidate.get("parsed"):
+        return None
+    ans = str(candidate["parsed"].get("answer", "")).strip().upper()
+    return ans if ans in ("A", "B", "C", "D") else None
+
+
+def fuse_answer_by_confidence(valid_candidates):
+    """
+    Answer fusion with low-confidence fallback.
+
+    投票足够明确时使用所有候选加权投票；
+    投票接近时回退到 best candidate，避免 0.90 强项被候选噪声拉低。
+    """
+    if not valid_candidates:
+        return "A"
+
+    valid = sorted(valid_candidates, key=lambda x: x["quality_score"], reverse=True)
+    best_answer = get_candidate_answer(valid[0])
+    answer_vote = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+
+    for c in valid:
+        ans = get_candidate_answer(c)
+        if ans in answer_vote:
+            answer_vote[ans] += max(0.0, float(c.get("quality_score", 0.0)))
+
+    total = sum(answer_vote.values())
+    if total <= 0:
+        return best_answer or "A"
+
+    ranked = sorted(answer_vote.items(), key=lambda x: x[1], reverse=True)
+    top_answer, top_weight = ranked[0]
+    second_weight = ranked[1][1]
+    margin = (top_weight - second_weight) / total
+
+    if margin >= ANSWER_CONFIDENCE_MARGIN:
+        return top_answer
+
+    return best_answer or top_answer
+
+
+def estimate_score_from_criteria(criteria):
+    """
+    从 criteria 分布估计一个弱约束总分。
+    只用于 total_score 离群修正，不作为主评分来源。
+    """
+    if not isinstance(criteria, dict):
+        return 50.0
+
+    level_scores = {"Good": 80.0, "Medium": 50.0, "Poor": 20.0}
+    scores = []
+    for dim in EXPECTED_DIMS:
+        val = str(criteria.get(dim, "")).strip()
+        if val in level_scores:
+            scores.append(level_scores[val])
+
+    if not scores:
+        return 50.0
+
+    return sum(scores) / len(scores)
+
+
+def weighted_median_score(score_weight_pairs):
+    """
+    计算 total_score 的加权中位数。
+    相比均值，能压低少量高温候选导致的极端分数。
+    """
+    valid_pairs = []
+    for score, weight in score_weight_pairs:
+        try:
+            valid_pairs.append((int(float(score)), float(weight)))
+        except (TypeError, ValueError):
+            continue
+
+    if not valid_pairs:
+        return 50
+
+    valid_pairs.sort(key=lambda x: x[0])
+    total_weight = sum(max(0.0, w) for _, w in valid_pairs)
+    if total_weight <= 0:
+        return valid_pairs[len(valid_pairs) // 2][0]
+
+    running = 0.0
+    midpoint = total_weight / 2.0
+    for score, weight in valid_pairs:
+        running += max(0.0, weight)
+        if running >= midpoint:
+            return score
+
+    return valid_pairs[-1][0]
+
+
+def fuse_total_score(top_candidates, weights, fused_criteria):
+    """
+    Metric-decoupled total_score fusion.
+
+    目标：
+    - 保留 Top-3 加权平均的线性信号，利于 PLCC。
+    - 用加权中位数压制离群候选，利于 SRCC。
+    - 只在明显偏离 criteria 隐含质量时做轻量拉回。
+    """
+    score_weight_pairs = []
+    weighted_sum = 0.0
+    total_weight = 0.0
+
+    for c, w in zip(top_candidates, weights):
+        try:
+            score = int(float(c["parsed"].get("total_score", 0)))
+        except (TypeError, ValueError):
+            score = 50
+        weight = max(0.0, float(w))
+        score_weight_pairs.append((score, weight))
+        weighted_sum += score * weight
+        total_weight += weight
+
+    if total_weight <= 0:
+        return 50
+
+    mean_score = weighted_sum / total_weight
+    median_score = weighted_median_score(score_weight_pairs)
+    score_values = [score for score, _ in score_weight_pairs]
+    spread = max(score_values) - min(score_values) if score_values else 0
+
+    # 高分歧样本更信中位数，低分歧样本保留均值。
+    if spread >= 18:
+        fused_score = 0.65 * mean_score + 0.35 * median_score
+    else:
+        fused_score = mean_score
+
+    expected_score = estimate_score_from_criteria(fused_criteria)
+    if abs(fused_score - expected_score) > 12:
+        fused_score = 0.75 * fused_score + 0.25 * expected_score
+
+    return max(1, min(100, round(fused_score)))
 
 
 # ================== Phase 2: 多候选聚合 ==================
@@ -815,33 +1007,14 @@ def fuse_candidates(all_scored):
     if total_weight == 0:
         return None
 
-    # ── total_score: Top-3 加权平均 ──
-    weighted_sum = 0.0
-    for c, w in zip(top3, weights):
-        try:
-            weighted_sum += int(float(c["parsed"].get("total_score", 0))) * w
-        except:
-            weighted_sum += 50 * w
-    fused_score = round(weighted_sum / total_weight)
-    fused_score = max(1, min(100, fused_score))
+    # ── criteria: 所有有效候选逐维置信度融合 ──
+    fused_criteria = fuse_criteria_by_confidence(valid)
 
-    # ── criteria: Top-3 每维独立加权投票 ──
-    fused_criteria = {}
-    for dim in EXPECTED_DIMS:
-        vote = {"Good": 0.0, "Medium": 0.0, "Poor": 0.0}
-        for c, w in zip(top3, weights):
-            val = str(c["parsed"].get("criteria", {}).get(dim, "")).strip()
-            if val in VALID_LEVELS:
-                vote[val] += w
-        fused_criteria[dim] = max(vote, key=vote.get)
+    # ── total_score: Top-3 稳健融合 + criteria 轻量约束 ──
+    fused_score = fuse_total_score(top3, weights, fused_criteria)
 
-    # ── answer: 全部候选加权投票 ──
-    answer_vote = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
-    for c in valid:
-        ans = str(c["parsed"].get("answer", "")).strip().upper()
-        if ans in answer_vote:
-            answer_vote[ans] += c["quality_score"]
-    fused_answer = max(answer_vote, key=answer_vote.get)
+    # ── answer: 加权投票 + 低置信回退 best candidate ──
+    fused_answer = fuse_answer_by_confidence(valid)
 
     return {
         "total_score": fused_score,

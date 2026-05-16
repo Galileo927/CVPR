@@ -1,6 +1,6 @@
 # Track 1 Experiment Log
 
-Last updated: 2026-05-14
+Last updated: 2026-05-16
 
 Track: Portrait Composition Understanding  
 Dataset size: 2000 test images  
@@ -753,3 +753,306 @@ Answer Acc
 ```
 
 如果 `fusion` 占多数且分数提升，继续优化融合权重；如果 `fallback_t02` 或 `best_only` 占比异常高，先调稳定性阈值和温度序列，不急着改 prompt。
+
+## 2026-05-16
+
+### 实际提交结果
+
+```text
+Participant: borui_yao
+ID: 733603
+SRCC: 0.84
+PLCC: 0.84
+Criteria Acc: 0.51
+Answer Acc: 0.90
+```
+
+对比：
+
+```text
+2026-05-13: 0.83 / 0.83 / 0.51 / 0.89
+2026-05-16: 0.84 / 0.84 / 0.51 / 0.90
+2026-05-16 23:07: 0.86 / 0.85 / 0.50 / 0.89
+```
+
+### 当前判断
+
+1. 当前推理链路已经进入高分段，`SRCC/PLCC` 从 0.83 到 0.84，说明 Top-3 融合与稳定性分流方向有效。
+2. `Answer Acc` 已达到 0.90，是当前最稳定的指标，不应优先改 answer prompt 或 answer 决策方式。
+3. `Criteria Acc` 仍停在 0.51，说明 13 个 criteria 的 A/B/C 分类仍是主要瓶颈。
+4. 当前继续大改 prompt 或温度序列的风险较高，容易破坏已经稳定的 `SRCC/PLCC` 和 `Answer Acc`。
+
+### 23:07 新提交结果与判断
+
+```text
+Participant: borui_yao
+ID: 734758
+SRCC: 0.86
+PLCC: 0.85
+Criteria Acc: 0.50
+Answer Acc: 0.89
+Equal Avg: 0.7750
+```
+
+对比 10:01 的 `733603`：
+
+```text
+733603 Equal Avg: 0.7725
+734758 Equal Avg: 0.7750
+delta: +0.0025
+```
+
+结论：
+
+1. 新融合明显提升了 `SRCC/PLCC`，说明 `total_score` 稳健融合有效。
+2. `Criteria Acc` 和 `Answer Acc` 各下降 0.01，说明 criteria/answer 的多候选融合略激进。
+3. 下一步不应回退 `total_score`，而应收紧 criteria/answer 融合，减少候选噪声对后两项的干扰。
+
+### 稳定涨分策略：Metric-Decoupled Conservative Fusion
+
+目标：在不改模型权重、不大改 prompt、不增加推理成本的前提下，对候选融合做细粒度调整。不同指标使用不同融合策略，而不是把 `total_score`、criteria、answer 完全绑定在同一个候选上。
+
+#### 1. Answer 保持当前策略
+
+保持当前所有有效候选按 `quality_score` 加权投票的方式。
+
+原因：
+
+```text
+Answer Acc = 0.90
+```
+
+answer 已经是强项，继续改 prompt 或引入 P1 规则可能带来无收益扰动。
+
+#### 2. total_score 保持 Top-3 加权平均，但增加轻量 outlier clamp
+
+当前 `total_score` 已经比较稳定，不能回到强后处理或训练集分布映射。
+
+建议只增加轻量约束：
+
+```text
+expected_score = mean(criteria_score)
+criteria_score: Good=80, Medium=50, Poor=20
+
+if abs(fused_total_score - expected_score) > 12:
+    final_total_score = round(0.75 * fused_total_score + 0.25 * expected_score)
+else:
+    final_total_score = fused_total_score
+```
+
+作用：
+
+1. 保留模型直接输出的排序能力。
+2. 只修正明显偏离 criteria 的 outlier。
+3. 理论上主要稳定 `SRCC/PLCC`，避免少量异常样本拖分。
+
+#### 3. Criteria 改成逐维置信度融合
+
+当前 `Criteria Acc = 0.51`，还有提升空间。建议不再简单用 Top-3 每维投票，而是对每个 criterion 单独判断投票置信度：
+
+```text
+对每个 criterion：
+    使用所有有效候选做 quality_score 加权投票
+    如果第一名和第二名差距明显：
+        用加权投票结果
+    如果差距很小：
+        回退到 best candidate 在该维度的判断
+```
+
+原因：
+
+1. 多候选多数投票适合高置信维度。
+2. 低置信维度上，简单投票容易被随机候选拉偏。
+3. best candidate 通常更自洽，作为低置信 fallback 更稳。
+
+这项最有希望提升 `Criteria Acc`，同时不会明显影响 answer。
+
+#### 4. P1 跨维度一致性只做低置信 tie-break，不做强惩罚
+
+当前 `score_cross_dimension_consistency()` 已定义但未接入。建议不要直接用它大幅改变 `quality_score`，因为手写相关性规则可能误伤复杂图像。
+
+更稳的接入方式：
+
+```text
+只在某个 criterion 投票差距很小的时候使用 P1。
+如果某个标签会造成 Good/Poor 强冲突，优先选择 Medium 或次高票标签。
+```
+
+这样 P1 只处理模型自己也不确定的 case，不会大面积改动稳定样本。
+
+### 理想效果
+
+预期影响：
+
+```text
+SRCC / PLCC: 0.84 -> 0.845~0.86
+Criteria Acc: 0.51 -> 0.52~0.54
+Answer Acc: 0.90 -> 基本保持
+```
+
+该策略的核心不是追求大幅跃迁，而是在当前高分段继续压低候选融合噪声，争取稳定小涨。
+
+### 为什么这个策略比继续改 prompt 稳
+
+1. Prompt 改动会同时影响 criteria、answer、total_score，风险不可控。
+2. 当前 answer 已经 0.90，不适合用 prompt 大改去冒险。
+3. 融合层改动只影响最终选择逻辑，不改变模型生成分布。
+4. 逐维 criteria 融合能针对当前瓶颈 `Criteria Acc=0.51`，比全局改推理更精确。
+
+### 下一步执行建议
+
+优先实现：
+
+```text
+1. criteria per-dimension confidence fusion
+2. total_score lightweight outlier clamp
+3. P1 only as low-confidence tie-break
+```
+
+暂时不要做：
+
+```text
+1. 大改 prompt
+2. 提高候选数量
+3. 改 answer 决策
+4. 强行恢复训练集 quantile mapping
+```
+
+### 本次已实现：四指标平衡融合
+
+用户明确目标不是只冲前两个指标，因此本次实现调整为四指标平衡融合：在保留 answer 稳定性的前提下，同时优化 `total_score` 和 criteria。
+
+实现位置：
+
+```text
+evaluation_multi.py
+- get_candidate_level()
+- get_weighted_level_votes()
+- fuse_criteria_by_confidence()
+- estimate_score_from_criteria()
+- weighted_median_score()
+- fuse_total_score()
+- fuse_candidates() 中接入 fuse_total_score()
+```
+
+#### A. Criteria 逐维置信度融合
+
+不再简单使用 Top-3 每维投票，而是对每个 criterion 使用所有有效候选做 `quality_score` 加权投票。
+
+具体策略：
+
+```text
+if top1_vote - top2_vote 足够大:
+    使用加权投票 top1
+else:
+    进入低置信分支
+```
+
+低置信分支：
+
+```text
+候选标签集合 = 有票标签 + best candidate 标签
+使用 P1 跨维度一致性作为 tie-break
+再看 vote_share
+最后看是否为 best candidate 标签
+```
+
+作用：
+
+1. 高置信维度利用多候选共识，提高 criteria 稳定性。
+2. 低置信维度避免被随机候选拉偏。
+3. P1 只在低置信场景参与，不做全局强惩罚，降低误伤风险。
+
+预期主要影响：
+
+```text
+Criteria Acc: 0.51 -> 0.52~0.54
+```
+
+#### B. total_score 稳健融合
+
+具体策略：
+
+1. 保留 Top-3 按 `quality_score` 加权平均，避免破坏当前已经有效的 PLCC 线性信号。
+2. 当 Top-3 的 `total_score` 分歧较大时，引入加权中位数：
+
+```text
+if score_spread >= 18:
+    fused_score = 0.65 * weighted_mean + 0.35 * weighted_median
+else:
+    fused_score = weighted_mean
+```
+
+3. 使用 fused criteria 估计弱约束分：
+
+```text
+Good = 80
+Medium = 50
+Poor = 20
+expected_score = mean(criteria_score)
+```
+
+4. 只在总分明显偏离 criteria 隐含质量时做轻量拉回：
+
+```text
+if abs(fused_score - expected_score) > 12:
+    fused_score = 0.75 * fused_score + 0.25 * expected_score
+```
+
+理论作用：
+
+1. `SRCC`：减少少量高温候选导致的离群分，降低排序反转。
+2. `PLCC`：保留加权平均的连续分数信号，同时削弱异常点对线性相关的破坏。
+3. `Criteria Acc`：通过 fused criteria 与 total_score 弱约束形成更一致的输出。
+4. `Answer Acc`：不影响 answer 决策。
+
+风险：
+
+1. 如果模型原始 `total_score` 已经非常准，过强的 criteria 拉回会损失排序细节。
+2. 因此本次只在 `abs(diff) > 12` 时触发，且只用 25% 权重拉回。
+3. Criteria 低置信 tie-break 使用的是手工 P1 规则，因此只允许在低置信场景生效，避免大范围影响。
+
+验证方式：
+
+全量跑完后重点比较：
+
+```text
+SRCC / PLCC 是否高于 0.84
+Criteria Acc 是否高于 0.51
+Answer Acc 是否保持 0.90 左右
+score_unique 是否保持充足
+score range 是否未明显收缩
+GEPA_BRANCH_STATS 中 fusion 占比是否仍为主路径
+```
+
+### 23:07 后续保守修正
+
+针对 `734758` 的表现，已做保守修正：
+
+```text
+保留 total_score 稳健融合
+criteria 改为 Top-3 置信投票 + 低置信回退 best candidate
+answer 改为加权投票 + 低置信回退 best candidate
+P1 不再参与最终 criteria 决策
+```
+
+原因：
+
+1. `SRCC/PLCC` 已经涨到 `0.86/0.85`，说明总分融合有效，不能回退。
+2. `Criteria/Answer` 下降更像是多候选投票把 best candidate 的正确判断拉偏。
+3. 因此后续只收紧后两项融合逻辑，不改 prompt、不改模型、不改候选数。
+
+新增阈值：
+
+```text
+CRITERIA_CONFIDENCE_MARGIN = 0.20
+ANSWER_CONFIDENCE_MARGIN = 0.15
+```
+
+预期：
+
+```text
+SRCC/PLCC: 尽量保持 0.86/0.85
+Criteria Acc: 0.50 -> 尝试回到 0.51
+Answer Acc: 0.89 -> 尝试回到 0.90
+```
